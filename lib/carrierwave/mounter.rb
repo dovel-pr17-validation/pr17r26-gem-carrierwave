@@ -1,0 +1,325 @@
+require "json"
+require "active_support/core_ext/array/wrap"
+
+module CarrierWave
+
+  # this is an internal class, used by CarrierWave::Mount so that
+  # we don't pollute the model with a lot of methods.
+  class Mounter # :nodoc:
+    class Single < Mounter # :nodoc
+      def identifier
+        uploaders.first&.identifier
+      end
+
+      def metadata
+        uploaders.first&.build_metadata
+      end
+
+      def temporary_identifier
+        temporary_identifiers.first
+      end
+    end
+
+    class Multiple < Mounter # :nodoc
+      def identifier
+        uploaders.map(&:identifier).presence
+      end
+
+      def metadata
+        uploaders.map(&:build_metadata).presence
+      end
+
+      def temporary_identifier
+        temporary_identifiers.presence
+      end
+    end
+
+    def self.build(record, column)
+      if record.class.uploader_options[column][:multiple]
+        Multiple.new(record, column)
+      else
+        Single.new(record, column)
+      end
+    end
+
+    attr_reader :column, :record, :remote_urls, :remove,
+                :integrity_errors, :processing_errors, :download_errors
+    attr_accessor :remote_request_headers, :uploader_options
+
+    def initialize(record, column)
+      @record = record
+      @column = column
+      @options = record.class.uploader_options[column]
+      @download_errors = []
+      @processing_errors = []
+      @integrity_errors = []
+
+      @removed_uploaders = []
+      @added_uploaders = []
+    end
+
+    def uploader_class
+      record.class.uploaders[column]
+    end
+
+    def blank_uploader
+      uploader_class.new(record, column)
+    end
+
+    def identifiers
+      uploaders.map(&:identifier)
+    end
+
+    def read_identifiers
+      [record.read_uploader(serialization_column)].flatten.reject(&:blank?)
+    end
+
+    ##
+    # The stored metadata, as many as there are identifiers. Whatever the column gives
+    # is accepted, so that it can be a json column, a serialized one, or plain text.
+    #
+    def read_metadata
+      return [] unless metadata_column
+
+      value = record.read_uploader(metadata_column)
+      value = JSON.parse(value) rescue nil if value.is_a?(String)
+      Array.wrap(value)
+    end
+
+    def uploaders
+      @uploaders ||= begin
+        metadata = read_metadata
+        read_identifiers.each_with_index.map do |identifier, index|
+          uploader = blank_uploader
+          # Has to come first, as retrieval derives the path from what was recorded
+          uploader.metadata = metadata[index]
+          uploader.retrieve_from_store!(identifier)
+          uploader
+        end
+      end
+    end
+
+    def cache(new_files)
+      return if !new_files.is_a?(Array) && new_files.blank?
+      old_uploaders = uploaders
+      attempts = new_files.map do |new_file|
+        handle_error do
+          if new_file.is_a?(String)
+            if (uploader = old_uploaders.detect { |old_uploader| old_uploader.identifier == new_file })
+              uploader.staged = true
+              uploader
+            else
+              begin
+                uploader = blank_uploader
+                uploader.retrieve_from_cache!(new_file)
+                uploader
+              rescue CarrierWave::InvalidParameter
+                nil
+              end
+            end
+          else
+            uploader = blank_uploader
+            uploader.cache!(new_file)
+            uploader
+          end
+        end
+      end
+      errors, new_uploaders = attempts.partition { |attempt| attempt.is_a?(CarrierWave::UploadError) }
+      # A refusal didn't ask for the mounted file to go
+      return if errors.any? && new_uploaders.all?(&:blank?)
+
+      @uploaders = new_uploaders.reject(&:blank?)
+      @removed_uploaders += (old_uploaders - @uploaders)
+      write_temporary_identifier
+    end
+
+    ##
+    # Takes the stored files with the given identifiers as the mounted ones, for when
+    # they were put in the store by something other than CarrierWave.
+    #
+    def identifiers=(new_identifiers)
+      return if !new_identifiers.is_a?(Array) && new_identifiers.blank?
+
+      old_uploaders = uploaders
+      @uploaders = new_identifiers.map do |identifier|
+        next if identifier.blank?
+
+        blank_uploader.tap { |uploader| uploader.adopt!(identifier) }
+      end.compact
+      @removed_uploaders += (old_uploaders - @uploaders)
+      write_temporary_identifier
+    end
+
+    def cache_names
+      # The names are carried over to the next request, which the files have to survive
+      uploaders.each(&:materialize_cache!)
+      uploaders.map(&:cache_name).compact
+    end
+
+    def cache_names=(cache_names)
+      cache_names = cache_names.reject(&:blank?)
+      return if cache_names.blank?
+      clear_unstaged
+      cache_names.each do |cache_name|
+        uploader = blank_uploader
+        uploader.retrieve_from_cache!(cache_name)
+        @uploaders << uploader
+      rescue CarrierWave::InvalidParameter
+        # ignore
+      end
+      write_temporary_identifier
+    end
+
+    def remote_urls=(urls)
+      if urls.nil?
+        urls = []
+      else
+        urls = Array.wrap(urls).reject(&:blank?)
+        return if urls.blank?
+      end
+      @download_errors.clear
+      @remote_urls = urls
+
+      old_uploaders = uploaders
+      attempts = @remote_urls.zip(remote_request_headers || []).map do |url, header|
+        handle_error do
+          uploader = blank_uploader
+          uploader.download!(url, header || {})
+          uploader
+        end
+      end
+      errors, new_uploaders = attempts.partition { |attempt| attempt.is_a?(CarrierWave::UploadError) }
+      # A refusal didn't ask for the mounted file to go
+      return if errors.any? && new_uploaders.all?(&:blank?)
+
+      @uploaders = old_uploaders.select(&:staged) + new_uploaders.reject(&:blank?)
+      @removed_uploaders += (old_uploaders - @uploaders)
+      write_temporary_identifier
+    end
+
+    def store!
+      uploaders.each(&:store!)
+    end
+
+    def write_identifier
+      return if record.frozen?
+
+      clear! if remove?
+
+      additions, remains = uploaders.partition(&:cached?)
+      existing_identifiers = (@removed_uploaders + remains).map(&:identifier)
+      additions.each do |uploader|
+        uploader.deduplicate(existing_identifiers)
+        existing_identifiers << uploader.identifier
+      end
+      @added_uploaders += additions
+
+      record.write_uploader(serialization_column, identifier)
+      record.write_uploader(metadata_column, metadata) if metadata_column
+    end
+
+    def urls(*args)
+      uploaders.map { |u| u.url(*args) }
+    end
+
+    def blank?
+      uploaders.none?(&:present?)
+    end
+
+    def remove=(value)
+      uploaders # Ensure that uploaders are initialized based on the current value
+      @remove = value
+      write_temporary_identifier
+    end
+
+    def remove?
+      remove.present? && (remove.to_s !~ /\A0|false$\z/)
+    end
+
+    def remove!
+      # The reader leaves a blank uploader in place, which has nothing to remove
+      uploaders.reject { |uploader| uploader.file.nil? }.each(&:remove!)
+      clear!
+    end
+
+    def clear!
+      @removed_uploaders += uploaders
+      @remove = nil
+      @uploaders = []
+    end
+
+    def reset_changes!
+      @removed_uploaders = []
+      @added_uploaders = []
+    end
+
+    def serialization_column
+      option(:mount_on) || column
+    end
+
+    def metadata_column
+      option(:metadata_column)
+    end
+
+    def remove_previous
+      current_paths = uploaders.map(&:path)
+      @removed_uploaders
+        .reject {|uploader| uploader.file.nil? || current_paths.include?(uploader.path) }
+        .each { |uploader| uploader.remove! if uploader.remove_previously_stored_files_after_update }
+      reset_changes!
+    end
+
+    def remove_added
+      current_paths = (@removed_uploaders + uploaders.select(&:staged)).map(&:path)
+      @added_uploaders
+        .reject {|uploader| current_paths.include?(uploader.path) }
+        .each { |uploader| uploader.remove! }
+      reset_changes!
+    end
+
+  private
+
+    def option(name)
+      self.uploader_options ||= {}
+      self.uploader_options[name] ||= record.class.uploader_option(column, name)
+    end
+
+    def clear_unstaged
+      uploaders # Ensure that uploaders are initialized based on the current value
+      staged, unstaged = @uploaders.partition(&:staged)
+      @uploaders = staged
+      @removed_uploaders += unstaged
+    end
+
+    # Records the error and gives it back, unless the mount wants it raised
+    def handle_error
+      yield
+    rescue CarrierWave::DownloadError => e
+      @download_errors << e
+      raise e unless option(:ignore_download_errors)
+      e
+    rescue CarrierWave::ProcessingError => e
+      @processing_errors << e
+      raise e unless option(:ignore_processing_errors)
+      e
+    rescue CarrierWave::IntegrityError => e
+      @integrity_errors << e
+      raise e unless option(:ignore_integrity_errors)
+      e
+    end
+
+    def write_temporary_identifier
+      return if record.frozen?
+
+      record.write_uploader(serialization_column, temporary_identifier)
+    end
+
+    def temporary_identifiers
+      if remove?
+        []
+      else
+        uploaders.map { |uploader| uploader.temporary_identifier }
+      end
+    end
+  end # Mounter
+end # CarrierWave

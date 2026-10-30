@@ -1,0 +1,119 @@
+require 'active_record'
+require 'carrierwave/validations/active_model'
+
+module CarrierWave
+  module ActiveRecord
+
+    include CarrierWave::Mount
+
+    ##
+    # See +CarrierWave::Mount#mount_uploader+ for documentation
+    #
+    def mount_uploader(column, uploader=nil, options={}, &block)
+      super
+
+      mod = Module.new
+      prepend mod
+      mod.class_eval <<-RUBY, __FILE__, __LINE__+1
+        def remote_#{column}_url=(url)
+          super
+          mark_#{column}_changed_on_error
+        end
+      RUBY
+    end
+
+    ##
+    # See +CarrierWave::Mount#mount_uploaders+ for documentation
+    #
+    def mount_uploaders(column, uploader=nil, options={}, &block)
+      super
+
+      mod = Module.new
+      prepend mod
+      mod.class_eval <<-RUBY, __FILE__, __LINE__+1
+        def remote_#{column}_urls=(urls)
+          super
+          mark_#{column}_changed_on_error
+        end
+      RUBY
+    end
+
+  private
+
+    def mount_base(column, uploader=nil, options={}, &block)
+      super
+
+      alias_method :read_uploader, :read_attribute
+      alias_method :write_uploader, :write_attribute
+      public :read_uploader
+      public :write_uploader
+
+      include CarrierWave::Validations::ActiveModel
+
+      validates_integrity_of column if uploader_option(column.to_sym, :validate_integrity)
+      validates_processing_of column if uploader_option(column.to_sym, :validate_processing)
+      validates_download_of column if uploader_option(column.to_sym, :validate_download)
+
+      after_save :"store_#{column}!"
+      before_save :"write_#{column}_identifier"
+      if ::ActiveRecord.try(:run_after_transaction_callbacks_in_order_defined)
+        after_commit :"remove_previously_stored_#{column}", :on => :update
+        after_commit :"reset_previous_changes_for_#{column}"
+        after_commit :"mark_remove_#{column}_false", :on => :update
+      else
+        after_commit :"mark_remove_#{column}_false", :on => :update
+        after_commit :"reset_previous_changes_for_#{column}"
+        after_commit :"remove_previously_stored_#{column}", :on => :update
+      end
+      after_commit :"remove_#{column}!", :on => :destroy
+      after_rollback :"remove_rolled_back_#{column}"
+
+      mod = Module.new
+      prepend mod
+      mod.class_eval <<-RUBY, __FILE__, __LINE__+1
+        # Reset cached mounter on record reload
+        def reload(*)
+          @_mounters = nil
+          super
+        end
+
+        # Reset cached mounter on record dup
+        def initialize_dup(other)
+          old_uploaders = _mounter(:"#{column}").uploaders
+          super
+          @_mounters[:"#{column}"] = nil
+          # The attribute needs to be cleared to prevent it from picked up as identifier
+          write_uploader(_mounter(:#{column}).serialization_column, nil)
+          if (metadata_column = _mounter(:#{column}).metadata_column)
+            write_uploader(metadata_column, nil)
+          end
+          _mounter(:"#{column}").cache(old_uploaders)
+        end
+
+        def write_#{column}_identifier
+          return unless has_attribute?(_mounter(:#{column}).serialization_column)
+          super
+        end
+
+        def #{column}=(new_file)
+          super
+          mark_#{column}_changed_on_error
+        end
+
+      private
+
+        # A refusal leaves the column as it was, and a record saved through an
+        # association is only validated when it changed, so say it changed
+        def mark_#{column}_changed_on_error
+          return if #{column}_integrity_errors.empty? && #{column}_processing_errors.empty? &&
+            #{column}_download_errors.empty?
+
+          __send__(:"\#{_mounter(:#{column}).serialization_column}_will_change!")
+        end
+      RUBY
+    end
+
+  end # ActiveRecord
+end # CarrierWave
+
+ActiveRecord::Base.extend CarrierWave::ActiveRecord
